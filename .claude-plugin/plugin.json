@@ -1,0 +1,36 @@
+{
+  "name": "tower",
+  "version": "1.0.0",
+  "description": "Tower: tickets, projects and free sessions with a flightdeck (agents, timeline, usage, routing), for any git repository (GitHub issues or Linear tickets), new projects and free sessions. /tower turns any session into a free session; /tower install adds the tower launcher (tmux).",
+  "author": {
+    "name": "Fabio Marconi"
+  },
+  "homepage": "https://github.com/Brutalino/claude-tower",
+  "repository": "https://github.com/Brutalino/claude-tower",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "theme": {
+      "type": "string",
+      "title": "Theme",
+      "description": "Colours of the rail and the deck: ghostty takes your Ghostty colours (the claude ones when none were found), claude uses the Claude palette, terminal follows your Claude Code theme, matrix is green on black. TOWER_THEME or CCtower --theme wins, and only a theme set at launch also recolours the rail's own frame and tmux.",
+      "options": [
+        "ghostty",
+        "claude",
+        "terminal",
+        "matrix"
+      ],
+      "default": "ghostty"
+    },
+    "routing": {
+      "type": "string",
+      "title": "Routing",
+      "description": "Which model does which kind of work: enforce reroutes and refuses spawns by the rules, observe only records what it would do, off does neither.",
+      "options": [
+        "enforce",
+        "observe",
+        "off"
+      ],
+      "default": "enforce"
+    }
+  }
+}

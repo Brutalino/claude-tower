@@ -1,0 +1,18 @@
+{
+  "name": "Matrix",
+  "base": "dark",
+  "overrides": {
+    "composerSidebarBackground": "#0B0F0B",
+    "background": "#0B0F0B",
+    "text": "#B8F5C0",
+    "inactive": "#3F8F4A",
+    "subtle": "#1F4A26",
+    "promptBorder": "#1F4A26",
+    "claude": "#00FF41",
+    "clawd_body": "#00FF41",
+    "suggestion": "#00FF41",
+    "success": "#00FF41",
+    "warning": "#D7FF5A",
+    "error": "#FF5C5C"
+  }
+}

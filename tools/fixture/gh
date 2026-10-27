@@ -1,0 +1,3 @@
+#!/bin/bash
+# Fake gh for the tower fixture. The logic lives in gh.py beside this file.
+exec /usr/bin/python3 "$(cd "$(dirname "$0")" && pwd)/gh.py" "$@"

@@ -1,0 +1,12 @@
+# Secrets: a .env (or a symlink to one) never goes in the repository.
+.env
+.env.*
+# Scratch outputs: test launches, screenshots, temporary files.
+.smoke/
+.shots/
+*.tmp
+.claude-plugin/types/
+node_modules/
+.DS_Store
+# Generated at every launch by bin/CCtower.
+themes/tower.json

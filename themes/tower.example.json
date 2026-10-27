@@ -1,0 +1,20 @@
+{
+  "name": "Tower",
+  "base": "dark",
+  "overrides": {
+    "composerSidebarBackground": "#020406",
+    "background": "#020406",
+    "userMessageBackground": "#020406",
+    "userMessageBackgroundHover": "#020406",
+    "text": "#E8E8E8",
+    "inactive": "#9A9A9A",
+    "subtle": "#5A5A5A",
+    "promptBorder": "#5A5A5A",
+    "claude": "#D97757",
+    "clawd_body": "#D97757",
+    "suggestion": "#D97757",
+    "success": "#4EBA65",
+    "warning": "#E0B341",
+    "error": "#F2777A"
+  }
+}

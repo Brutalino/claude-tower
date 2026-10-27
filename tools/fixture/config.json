@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "project": { "name": "App", "repo": "fixture/app", "baseBranch": "staging", "mainCheckout": null },
+  "tickets": {
+    "kind": "linear",
+    "team": null,
+    "query": { "first": 50, "candidateLabel": "bug", "candidateStates": ["backlog", "unstarted"], "mineStates": ["backlog", "unstarted", "started"] },
+    "idPattern": { "source": "(?:^|[^a-z0-9])(tkt-\\d+)", "flags": "i" },
+    "inputPattern": { "source": "^(?:tkt-)?(\\d+)$", "flags": "i" },
+    "idTemplate": "TKT-{n}"
+  },
+  "worktree": {
+    "pathTemplate": "{repoParent}/{repo}-{key}",
+    "followExisting": true,
+    "branch": { "kind": "linear-branch-name", "fallback": "{keyLower}-{slug}" },
+    "slugMax": 40,
+    "stackOnBlocker": true
+  },
+  "workflow": {
+    "steps": {
+      "start": { "skill": "start-ticket", "args": "{key}", "phase": "not started", "session": "ticket" },
+      "openPr": { "skill": "open-pr", "args": "", "phase": "implementing", "session": "ticket" },
+      "review": { "skill": "review", "args": "{pr}", "phase": null, "session": "review" },
+      "wrapUp": { "skill": "wrap-up", "args": "{pr}", "phase": null, "session": "ticket" }
+    }
+  },
+  "phases": {
+    "source": "state-file",
+    "path": ".work/state.json",
+    "values": ["planning", "implementing"],
+    "mapping": { "planning": "planning", "implementing": "implementing" },
+    "unknownAs": "implementing"
+  },
+  "review": {
+    "skill": "review",
+    "args": "{pr}",
+    "heading": { "source": "^##\\s+Self-review\\b(?:\\s+\\(round\\s+(\\d+)\\))?.*$", "flags": "im" },
+    "roundPattern": { "source": "\\(round\\s+(\\d+)\\)", "flags": "i" },
+    "sections": ["Scope check", "Quality check", "Blockers", "Suggestions", "Good stuff"],
+    "verdict": null,
+    "blockersSection": { "heading": "Blockers", "none": "_(none)_" },
+    "savePath": ".work/review/pr-{pr}-round-{round}.md"
+  },
+  "waits": {
+    "openPr": { "patterns": [{ "source": "mark the pr ready", "flags": "i" }, { "source": "commit", "flags": "i" }], "awayAnswer": "yes" },
+    "post": { "patterns": [{ "source": "\\b(?:post|publish)\\b(?!-)", "flags": "i" }, { "source": "\\bpubblic", "flags": "i" }, { "source": "\\bcomment on the PR\\b", "flags": "i" }, { "source": "gh pr comment", "flags": "i" }], "awayAnswer": null }
+  },
+  "checks": { "sources": ["github-ci"] },
+  "env": { "kind": "skill", "name": "dev-env", "ports": { "first": 5173, "slots": 7 } },
+  "repoActions": [
+    { "key": "n", "label": "new ticket", "skill": "new-ticket", "cwd": "main" },
+    { "key": "t", "label": "triage", "skill": "triage", "cwd": "main" }
+  ],
+  "routing": "defaults",
+  "delivery": "pr"
+}

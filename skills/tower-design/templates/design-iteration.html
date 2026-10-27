@@ -1,0 +1,45 @@
+<!doctype html>
+<!-- One design iteration (stage 6, without a design canvas): the directions side by side, each a frame per screen.
+     Saved as design/iteration-<n>.html; a new iteration is a new file, older ones are kept. Mockups only: no
+     product code. -->
+<html lang="<language>">
+<head>
+<meta charset="utf-8">
+<title><Project> · design · iteration <n></title>
+<style>
+  body { margin: 0; padding: 24px; font: 14px/1.4 system-ui, sans-serif; background: #f2f2f0; color: #1d1d1b; }
+  header { margin-bottom: 24px; }
+  header p { max-width: 70ch; margin: 4px 0; color: #55554f; }
+  .directions { display: flex; gap: 32px; align-items: flex-start; overflow-x: auto; }
+  .direction { flex: 0 0 auto; }
+  .direction h2 { margin: 0 0 4px; font-size: 16px; }
+  .direction > p { margin: 0 0 12px; max-width: 46ch; color: #55554f; }
+  .screens { display: flex; gap: 16px; }
+  .screen { width: 390px; height: 844px; background: #fff; border-radius: 24px; box-shadow: 0 1px 4px rgba(0,0,0,.15); overflow: hidden; }
+  .screen-label { margin: 6px 0 0; font-size: 12px; color: #77776f; }
+</style>
+</head>
+<body>
+<header>
+  <h1><Project> · iteration <n> · <YYYY-MM-DD></h1>
+  <p>What this iteration answers: <the question, e.g. "which direction for the home screen">.</p>
+  <p>Changed since iteration <n-1>: <the owner's feedback it applies, quoted>.</p>
+</header>
+<section class="directions">
+  <article class="direction">
+    <h2>A · <name></h2>
+    <p><The idea of this direction and its trade-off, in one or two sentences.></p>
+    <div class="screens">
+      <figure><div class="screen"><!-- the screen --></div><figcaption class="screen-label"><screen · state></figcaption></figure>
+    </div>
+  </article>
+  <article class="direction">
+    <h2>B · <name></h2>
+    <p><…></p>
+    <div class="screens">
+      <figure><div class="screen"></div><figcaption class="screen-label"><screen · state></figcaption></figure>
+    </div>
+  </article>
+</section>
+</body>
+</html>

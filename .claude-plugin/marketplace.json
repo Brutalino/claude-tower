@@ -1,0 +1,12 @@
+{
+  "name": "claude-tower",
+  "owner": { "name": "Fabio Marconi" },
+  "description": "Tower, a Claude Code mod and launcher: tickets, projects and free sessions with a flightdeck",
+  "plugins": [
+    {
+      "name": "tower",
+      "source": "./",
+      "description": "Tickets, projects and free sessions with a flightdeck: any git repository, new projects and free sessions"
+    }
+  ]
+}

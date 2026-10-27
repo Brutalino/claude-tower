@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# tower-statusline: the dim row under the prompt box. Left: model · effort (tower on the rail).
+# Right: a spinner and the deck's footer while working, ○ when idle, ◆ waiting for you,
+# ✓ ready for review / to merge.
+# Reads Claude Code's JSON on stdin and the session's <Tower's folder>/sessions/<id>.json (TOWER_STATE_DIR, else ~/.claude/tower).
+# Prints nothing and exits 0 on any error.
+input="$(cat 2>/dev/null)" || exit 0
+width="$(tput cols 2>/dev/null)" || width=""
+[ -n "$width" ] || width="${COLUMNS:-80}"
+# Claude Code indents the row by 2 and cuts the last 2 columns with an ellipsis.
+width=$(( width - ${TOWER_STATUSLINE_INSET:-4} ))
+[ "$width" -gt 0 ] 2>/dev/null || exit 0
+
+/usr/bin/python3 -I - "$width" "${TOWER_STATE_DIR:-$HOME/.claude/tower}/sessions" "$input" <<'PY' 2>/dev/null || exit 0
+import json, sys, time, unicodedata
+
+width, folder, raw = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+DIM, ACCENT, NEEDS, READY = (154, 154, 154), (217, 119, 87), (224, 179, 65), (78, 186, 101)
+
+def rgb(value):
+    value = str(value).lstrip("#")
+    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4)) if len(value) == 6 else None
+
+# The ghostty theme's colours, written by the launcher next to the sessions folder.
+try:
+    import os
+    with open(os.path.join(os.path.dirname(folder), "palette.json")) as handle:
+        roles = json.load(handle)
+    DIM = rgb(roles.get("dim")) or DIM
+    ACCENT = rgb(roles.get("accent")) or ACCENT
+    NEEDS = rgb(roles.get("needsYou")) or NEEDS
+    READY = rgb(roles.get("done")) or READY
+except Exception:
+    pass
+
+def paint(rgb, text):
+    return "\033[38;2;%d;%d;%dm%s\033[0m" % (rgb + (text,)) if text else ""
+
+def cells(text):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+def label(model):
+    # claude-fable-5-1[1m] -> fable-5.1, claude-haiku-4-5-20251001 -> haiku-4.5
+    name = model.split("[")[0]
+    if name.startswith("claude-"):
+        name = name[len("claude-"):]
+    parts = name.split("-")
+    if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+        return "%s-%s.%s" % (parts[0], parts[1], parts[2])
+    return name
+
+stdin = json.loads(raw)
+session = stdin.get("session_id") or ""
+status = {}
+if session and "/" not in session:
+    try:
+        with open("%s/%s.json" % (folder, session)) as handle:
+            status = json.load(handle)
+    except Exception:
+        status = {}
+
+if status.get("role") == "rail":
+    left, right = "tower", ""
+else:
+    model = status.get("model") or (stdin.get("model") or {}).get("id") or ""
+    effort = status.get("effort")
+    left = " · ".join(part for part in (label(model) if model else "", effort or "") if part)
+    footer = status.get("footer") or ""
+    if status.get("needsYou"):
+        right = paint(NEEDS, "◆") + " " + paint(DIM, "waiting for you")
+        shown = "◆ waiting for you"
+    elif status.get("ready") in ("review", "merge") and status.get("state") != "working":
+        text = "ready for review" if status.get("ready") == "review" else "ready to merge"
+        right = paint(READY, "✓ " + text)
+        shown = "✓ " + text
+    elif status.get("state") == "working":
+        frame = "◐◓◑◒"[int(time.time()) % 4]
+        right = paint(ACCENT, frame) + (" " + paint(DIM, footer) if footer else "")
+        shown = frame + (" " + footer if footer else "")
+    elif status:
+        right, shown = paint(DIM, "○"), "○"
+    else:
+        right, shown = "", ""
+
+if status.get("role") == "rail":
+    shown = ""
+# Away mode on (decision 023): a dim word before the right side.
+if status.get("away") and status.get("role") != "rail":
+    right = paint(DIM, "away") + ("  " + right if right else "")
+    shown = "away" + ("  " + shown if shown else "")
+gap = width - cells(left) - cells(shown)
+if gap < 1:
+    right, gap = "", max(1, width - cells(left))
+sys.stdout.write(paint(DIM, left) + " " * gap + right + "\n")
+PY
+exit 0

@@ -1,0 +1,888 @@
+#!/usr/bin/env bash
+# CCtower: one tmux window of Claude Code sessions, one per ticket of the current folder when it has a Tower
+# configuration, else one per ticket of the edition's project (TOWER_REPO, decision 083). One Tower per project, each on its own tmux socket (decision 059).
+# Usage: CCtower [--no-attach | --kill | --kill-all | --list] [--theme ghostty|claude|terminal|matrix] [--bg <hex>]
+set -euo pipefail
+
+usage() {
+  echo "usage: CCtower [--no-attach | --kill | --kill-all | --list] [--theme ghostty|claude|terminal|matrix] [--bg <hex>]" >&2
+}
+
+die() {
+  echo "CCtower: $1" >&2
+  exit 1
+}
+
+# dotenv_value NAME: the value of the NAME= line in <plugin root>/.env, else in <state dir>/.env (decision 066: an
+# installed plugin's root is Claude Code's versioned cache, so a .env lives in Tower's own folder), quotes stripped.
+# Read line by line, never sourced or evaluated; the value only reaches this shell's stdout, never a command line.
+dotenv_value() {
+  local file line value
+  for file in "$plugin_root/.env" "$state_dir/.env"; do
+    [ -f "$file" ] || continue
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line#export }"
+      case "$line" in
+        "$1="*)
+          value="${line#*=}"
+          value="${value%$'\r'}"
+          case "$value" in
+            \"*\") value="${value#\"}"; value="${value%\"}" ;;
+            \'*\') value="${value#\'}"; value="${value%\'}" ;;
+          esac
+          printf '%s' "$value"
+          return 0
+          ;;
+      esac
+    done <"$file"
+  done
+  return 1
+}
+
+# The plugin root is the parent of this script's folder, following symlinks.
+resolve_plugin_root() {
+  local source="${BASH_SOURCE[0]}"
+  local dir
+  while [ -L "$source" ]; do
+    dir="$(cd -P "$(dirname "$source")" && pwd)"
+    source="$(readlink "$source")"
+    case "$source" in
+      /*) ;;
+      *) source="$dir/$source" ;;
+    esac
+  done
+  dir="$(cd -P "$(dirname "$source")" && pwd)"
+  cd -P "$dir/.." && pwd
+}
+
+# theme_colours NAME: sets the tmux colours and the Claude Code theme of a mod theme; fails for an unknown name.
+# A copy of `border`, `borderActive`, `hintKey`, `hintWord` and `claudeTheme` in hooks/core/theme.ts, the
+# source; tests/theme.test.ts checks that every line here matches it.
+# ghostty takes its colours from the palette (write_ghostty_palette sets ghostty_*), else the claude ones; the
+# check skips it (tools/check-theme-colours.sh).
+theme_colours() {
+  case "$1" in
+    ghostty) border="${ghostty_faint:-#5A5A5A}" border_active="${ghostty_accent:-#D97757}" hint_key="${ghostty_text:-#E8E8E8}" hint_word="${ghostty_dim:-#9A9A9A}" claude_theme='custom:tower:tower' ;;
+    claude) border='#5A5A5A' border_active='#D97757' hint_key='#E8E8E8' hint_word='#9A9A9A' claude_theme='custom:tower:tower' ;;
+    terminal) border='colour240' border_active='colour208' hint_key='default' hint_word='colour245' claude_theme='' ;;
+    matrix) border='#1F4A26' border_active='#00FF41' hint_key='#B8F5C0' hint_word='#3F8F4A' claude_theme='custom:tower:matrix' ;;
+    *) return 1 ;;
+  esac
+}
+
+# hex_colour VALUE: prints VALUE as #RRGGBB when it is six hex digits, with or without #; fails otherwise.
+hex_colour() {
+  local value="${1#\#}"
+  [[ "$value" =~ ^[0-9A-Fa-f]{6}$ ]] || return 1
+  printf '#%s\n' "$(printf '%s' "$value" | tr '[:lower:]' '[:upper:]')"
+}
+
+# ghostty_palette [CONFIG_DIR [BUILTIN_THEMES]]: prints the active Ghostty colours as JSON: background, foreground,
+# cursor-color, selection-background, selection-foreground (#RRGGBB) and palette {"0".."15"}; fails when it finds none.
+# The theme file named by `theme = name` (`light:x,dark:y`: the dark one; an absolute path as it is) comes from
+# CONFIG_DIR/themes, else Ghostty's own theme folder; the config's own colour lines override it, the last line winning.
+ghostty_palette() {
+  /usr/bin/python3 -I - "${1:-${XDG_CONFIG_HOME:-$HOME/.config}/ghostty}" "${2:-/Applications/Ghostty.app/Contents/Resources/ghostty/themes}" <<'PY'
+import json, os, re, sys
+config_dir, builtin = sys.argv[1], sys.argv[2]
+KEYS = ('background', 'foreground', 'cursor-color', 'selection-background', 'selection-foreground')
+
+def hex_colour(value):
+    value = value.strip().strip('"').strip().lstrip('#')
+    return '#' + value.upper() if re.fullmatch(r'[0-9A-Fa-f]{6}', value) else None
+
+def read(path):
+    colours, palette, theme = {}, {}, None
+    try:
+        with open(path, encoding='utf-8') as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        match = re.match(r'\s*([a-z0-9-]+)\s*=\s*(.*?)\s*$', line)
+        if not match:
+            continue
+        key, value = match.groups()
+        if key == 'theme':
+            theme = value.strip('"').strip() or None
+        elif key in KEYS:
+            colour = hex_colour(value)
+            if colour:
+                colours[key] = colour
+        elif key == 'palette':
+            entry = re.fullmatch(r'"?\s*(\d+)\s*=\s*([^"]+?)\s*"?', value)
+            if entry and 0 <= int(entry.group(1)) <= 15 and hex_colour(entry.group(2)):
+                palette[str(int(entry.group(1)))] = hex_colour(entry.group(2))
+    return colours, palette, theme
+
+config = read(os.path.join(config_dir, 'config')) or ({}, {}, None)
+name = config[2]
+if name and ',' in name or name and ':' in name and not os.path.isabs(name):
+    parts = dict(part.split(':', 1) if ':' in part else ('', part) for part in (p.strip() for p in name.split(',')))
+    name = (parts.get('dark') or parts.get('') or parts.get('light') or '').strip() or None
+found = None
+if name:
+    paths = [name] if os.path.isabs(name) else [os.path.join(config_dir, 'themes', name), os.path.join(builtin, name)]
+    for path in paths:
+        if os.path.isfile(path):
+            found = read(path)
+            if found:
+                break
+colours, palette = dict(found[0]) if found else {}, dict(found[1]) if found else {}
+colours.update(config[0])
+palette.update(config[1])
+if not colours and not palette:
+    sys.exit(1)
+out = {'theme': name if found else None}
+out.update({key: colours[key] for key in KEYS if key in colours})
+out['palette'] = {key: palette[key] for key in sorted(palette, key=int)}
+print(json.dumps(out))
+PY
+}
+
+# resolve_bg GHOSTTY_JSON: the one background of the whole surface: --bg ($bg_flag), else TOWER_BG, else Ghostty's
+# background (its config, else its theme file; see ghostty_palette), else #1E1E1E.
+resolve_bg() {
+  if [ -n "${bg_flag:-}" ]; then hex_colour "$bg_flag" || die "--bg is not a hex colour: $bg_flag"; return; fi
+  if [ -n "${TOWER_BG:-}" ]; then hex_colour "$TOWER_BG" || die "TOWER_BG is not a hex colour: $TOWER_BG"; return; fi
+  if [[ "${1:-}" =~ \"background\":\ \"(#[0-9A-F]{6})\" ]]; then printf '%s\n' "${BASH_REMATCH[1]}"; return; fi
+  printf '#1E1E1E\n'
+}
+
+# ghostty_roles GHOSTTY_JSON SURFACE: prints the ghostty theme's colours by meaning as JSON (decision 039):
+# surface; text = foreground; brightText = selection-foreground (else palette 15); dim = palette 8; faint =
+# selection-background; accent = cursor-color; needsYou = palette 3; done = palette 2, or 10 when 2's contrast
+# with the surface is under 3; error = palette 1; models opus 5, sonnet 4, haiku 6, other 8. A missing colour
+# takes the claude theme's.
+ghostty_roles() {
+  /usr/bin/python3 -I - "$1" "$2" <<'PY'
+import json, sys
+raw, surface = json.loads(sys.argv[1]), sys.argv[2]
+palette = raw.get('palette', {})
+
+def luminance(colour):
+    channels = [int(colour[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    r, g, b = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+def contrast(a, b):
+    high, low = sorted((luminance(a), luminance(b)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+text = raw.get('foreground', '#E8E8E8')
+done = palette.get('2', '#4EBA65')
+if contrast(done, surface) < 3 and '10' in palette:
+    done = palette['10']
+print(json.dumps({
+    'surface': surface,
+    'text': text,
+    'brightText': raw.get('selection-foreground', palette.get('15', text)),
+    'dim': palette.get('8', '#9A9A9A'),
+    'faint': raw.get('selection-background', '#5A5A5A'),
+    'accent': raw.get('cursor-color', '#D97757'),
+    'needsYou': palette.get('3', '#E0B341'),
+    'done': done,
+    'error': palette.get('1', '#F2777A'),
+    'models': {'opus': palette.get('5', '#B48EF7'), 'sonnet': palette.get('4', '#7FB4F5'), 'haiku': palette.get('6', '#5ED1C0'), 'other': palette.get('8', '#9A9A9A')},
+}, indent=2))
+PY
+}
+
+# write_tower_theme BG [ROLES_FILE]: themes/tower.json (generated, gitignored): the claude palette of themes/claude.json
+# with the pane fill and the background set to BG, so the mod's panels match the terminal. With ROLES_FILE (the
+# ghostty theme's palette.json), its text, dim, faint, accent, success, warning and error colours replace the claude ones.
+write_tower_theme() {
+  /usr/bin/python3 -I - "$plugin_root/themes" "$1" "${2:-}" <<'PY'
+import json, os, sys
+folder, bg, roles_file = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(os.path.join(folder, 'claude.json')) as handle:
+    theme = json.load(handle)
+theme['name'] = 'Tower'
+if roles_file:
+    with open(roles_file) as handle:
+        roles = json.load(handle)
+    theme['name'] = 'Tower (Ghostty)'
+    for key, role in (('text', 'text'), ('inactive', 'dim'), ('subtle', 'faint'), ('promptBorder', 'faint'), ('claude', 'accent'),
+                      ('clawd_body', 'accent'), ('suggestion', 'accent'), ('success', 'done'), ('warning', 'needsYou'), ('error', 'error')):
+        theme['overrides'][key] = roles[role]
+theme['overrides']['composerSidebarBackground'] = bg
+theme['overrides']['background'] = bg
+# The user rows too: no grey band behind the person's prompt (decision 031).
+theme['overrides']['userMessageBackground'] = bg
+theme['overrides']['userMessageBackgroundHover'] = bg
+path = os.path.join(folder, 'tower.json')
+with open(path + '.tmp', 'w') as handle:
+    json.dump(theme, handle, indent=2)
+    handle.write('\n')
+os.replace(path + '.tmp', path)
+PY
+}
+
+# edition_file NAME: the first line of hooks/<edition>/NAME, the edition's folder beside core (decision 083: the one
+# that holds a repo-slug); fails without an edition or without that file.
+edition_file() {
+  local slug_file line
+  for slug_file in "$plugin_root"/hooks/*/repo-slug; do
+    [ -f "$slug_file" ] || continue
+    [ -f "$(dirname "$slug_file")/$1" ] || return 1
+    IFS= read -r line <"$(dirname "$slug_file")/$1" || [ -n "$line" ] || return 1
+    [ -n "$line" ] || return 1
+    printf '%s\n' "$line"
+    return 0
+  done
+  return 1
+}
+
+# tower_config_for <folder>: whether Tower has a configuration for the git folder (decision 053, resolveConfig in
+# hooks/core/config.ts, which the sessions run on the same facts): prints `edition` when its origin is the edition's
+# repository (edition_file repo-slug, lowercase `owner/name`; case aside), `stored` when $state_dir/projects/<id>.json
+# holds a JSON object (<id>: its main checkout's path, every character but letters and digits a `-`; the session
+# validates it), else prints nothing and fails. A folder named by TOWER_REPO (the edition's checkout, a fixture's) is the
+# edition's without asking.
+tower_config_for() {
+  local main origin slug file edition
+  main="$(git -C "$1" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')" || main=""
+  [ -n "$main" ] || return 1
+  origin="$(git -C "$1" remote get-url origin 2>/dev/null)" || origin=""
+  slug="$(printf '%s' "$origin" | sed -nE 's#^(https?://([^@/]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/?$#\3/\4#p' | sed -E 's#\.git$##' | tr '[:upper:]' '[:lower:]')"
+  edition="$(edition_file repo-slug | tr '[:upper:]' '[:lower:]')" || edition=""
+  if [ -n "$edition" ] && [ "$slug" = "$edition" ]; then printf 'edition\n'; return 0; fi
+  file="$state_dir/projects/$(printf '%s' "$main" | sed 's/[^a-zA-Z0-9]/-/g').json"
+  if [ -f "$file" ] && /usr/bin/python3 -I -c 'import json, sys; sys.exit(0 if isinstance(json.load(open(sys.argv[1])), dict) else 1)' "$file" 2>/dev/null; then
+    printf 'stored\n'
+    return 0
+  fi
+  return 1
+}
+
+# resolve_project: what this launch opens. The current folder first (decision 055): a git folder with a configuration
+# (the edition's by its origin, or a stored one) is that project, whatever TOWER_REPO says; for the edition's folder a
+# set TOWER_REPO still names the checkout, as before. TOWER_REPO makes any other folder the edition's only with an
+# explicit TOWER_TMUX_SOCKET (test launches, a fixture), and only when there is an edition (decision 083). Then a design state whose stage 8 is not done (decision 064): a design
+# Tower, one per folder. Any other folder has no project (decision 060): a free Tower in it, `remembered` set when the
+# start menu's `r` stored it as free. The mod resolves in the same order (sessionChoice; the mode handed on as TOWER_MODE).
+# Sets repo (its folder), project_kind (`edition`, `stored`, `design` or `free`) and project_main (its main checkout; a
+# design Tower's own folder); fails with resolve_error when TOWER_REPO names no folder. Asked at every launch: the stored
+# file and the design state are read each time.
+resolve_project() {
+  local in_git="" cwd_config=""
+  remembered=""
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 && in_git=1
+  [ -n "$in_git" ] && cwd_config="$(tower_config_for "$PWD")" || true
+  if [ "$cwd_config" = stored ]; then
+    repo="$PWD" project_kind=stored
+  elif [ "$cwd_config" = edition ]; then
+    repo="${TOWER_REPO:-$PWD}" project_kind=edition
+  elif [ -n "${TOWER_TMUX_SOCKET:-}" ] && [ -n "${TOWER_REPO:-}" ] && edition_file repo-slug >/dev/null; then
+    repo="$TOWER_REPO" project_kind=edition
+  elif design_open "$PWD"; then
+    repo="$PWD" project_kind=design
+  else
+    repo="$PWD" project_kind=free
+    remembered_free "$(pwd -P)" && remembered=1
+  fi
+  [ -d "$repo" ] || { resolve_error="TOWER_REPO is not a directory: $repo"; return 1; }
+  repo="$(cd -P "$repo" && pwd)"
+  project_main="$(git -C "$repo" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')" || project_main=""
+  [ -n "$project_main" ] || project_main="$repo"
+  if [ "$project_kind" = design ]; then project_main="$repo"; fi
+  return 0
+}
+
+# design_open DIR: DIR holds a design state file (.tower/design.json, decision 062) that tools/tower-design-state.sh
+# validates and whose stage 8 (setup) is not done: a design Tower (decision 064).
+design_open() {
+  [ -f "$1/.tower/design.json" ] || return 1
+  "$plugin_root/tools/tower-design-state.sh" -C "$1" validate >/dev/null 2>&1 || return 1
+  /usr/bin/python3 -I -c 'import json, sys; stages = json.load(open(sys.argv[1]))["stages"]; sys.exit(1 if stages[7].get("status") == "done" else 0)' "$1/.tower/design.json" 2>/dev/null
+}
+
+# remembered_free DIR: the start menu's `r` stored DIR as free in $state_dir/folders.json (`{ "<abs path>": "free" }`).
+remembered_free() {
+  [ -f "$state_dir/folders.json" ] || return 1
+  /usr/bin/python3 -I -c 'import json, sys
+try:
+    known = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(known, dict) and known.get(sys.argv[2]) == "free" else 1)' "$state_dir/folders.json" "$1"
+}
+
+# remember_free DIR: DIR as free in $state_dir/folders.json, the file written whole through a temporary one.
+remember_free() {
+  /usr/bin/python3 -I - "$state_dir/folders.json" "$1" <<'PY'
+import json, os, sys
+path, folder = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as handle:
+        known = json.load(handle)
+except Exception:
+    known = {}
+known = known if isinstance(known, dict) else {}
+known[folder] = 'free'
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path + '.tmp', 'w') as handle:
+    json.dump(known, handle, indent=2, sort_keys=True)
+    handle.write('\n')
+os.replace(path + '.tmp', path)
+PY
+}
+
+# folder_kind DIR: `git` inside a git work tree, `empty` with no entry but dotfiles (.DS_Store, .tower), else `other`.
+folder_kind() {
+  local entry
+  if git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1; then printf 'git\n'; return 0; fi
+  for entry in "$1"/*; do
+    if [ -e "$entry" ] || [ -L "$entry" ]; then printf 'other\n'; return 0; fi
+  done
+  printf 'empty\n'
+}
+
+# start_entries KIND: the start menu's entries for a folder of that kind, `<choice><TAB><label>` each, the default first.
+start_entries() {
+  local free='Free session — Claude with the flightdeck, nothing set up'
+  case "$1" in
+    git) printf 'setup\tGit repository — set up Tower for this repository (tower-setup)\nfree\t%s\n' "$free" ;;
+    empty) printf 'design\tNew project — design it in this folder (tower-design)\nfree\t%s\n' "$free" ;;
+    *) printf 'free\t%s\ndesign\tNew project — design it in this folder\n' "$free" ;;
+  esac
+}
+
+# start_menu KIND SHOWN: the start menu (decision 064) on $menu_out (default /dev/tty), keys from $menu_in (default
+# /dev/tty): ↑↓ or k j move, ↵ opens, a digit opens that entry, r toggles remember, esc or q cancels. Sets start_choice
+# and start_remember (1 when r was on); fails on cancel or at the end of the keys.
+start_menu() {
+  local kind="$1" shown="$2" out="${menu_out:-/dev/tty}" choices=() labels=() choice label at=0 key rest drawn=0 i lines
+  start_remember=""
+  while IFS=$'\t' read -r choice label; do
+    choices+=("$choice")
+    labels+=("$label")
+  done < <(start_entries "$kind")
+  exec 3<"${menu_in:-/dev/tty}" 4>"$out"
+  printf '\033[?25l' >&4
+  while :; do
+    lines=" Tower · $shown"$'\n'
+    for i in "${!choices[@]}"; do
+      if [ "$i" -eq "$at" ]; then lines+=$' \033[1m▸ '"${labels[$i]}"$'\033[0m\n'; else lines+="   ${labels[$i]}"$'\n'; fi
+    done
+    if [ "$kind" = other ] && [ "${choices[$at]}" = design ]; then
+      lines+=$' \033[33m! this folder is not empty: the new project is designed in it, beside what is there\033[0m\n'
+    fi
+    lines+=$' \033[2m↑↓ choose · ↵ open · r remember for this folder · q cancel\033[0m\n'
+    if [ -n "$start_remember" ]; then
+      if [ "${choices[$at]}" = free ]; then lines+=$' \033[2m✓ remember: Free session opens here from now on, without this menu\033[0m\n'
+      else lines+=$' \033[2m✓ remember: only Free session is remembered (the others become projects)\033[0m\n'; fi
+    fi
+    [ "$drawn" -eq 0 ] || printf '\033[%dA\r\033[J' "$drawn" >&4
+    printf '%s' "$lines" >&4
+    drawn="$(printf '%s' "$lines" | wc -l | tr -d ' ')"
+    if ! IFS= read -rsn1 -u 3 key; then key=q; fi
+    if [ "$key" = $'\033' ]; then
+      rest=""
+      IFS= read -rsn2 -t 1 -u 3 rest || true
+      case "$rest" in
+        '[A'|'OA') key=up ;;
+        '[B'|'OB') key=down ;;
+        *) key=q ;;
+      esac
+    fi
+    case "$key" in
+      up|k) if [ "$at" -gt 0 ]; then at=$((at - 1)); fi ;;
+      down|j) if [ "$at" -lt $((${#choices[@]} - 1)) ]; then at=$((at + 1)); fi ;;
+      [1-9]) if [ "$key" -le "${#choices[@]}" ]; then at=$((key - 1)); break; fi ;;
+      r) if [ -n "$start_remember" ]; then start_remember=""; else start_remember=1; fi ;;
+      '') break ;;
+      q) printf '\033[?25h' >&4; exec 3<&- 4>&-; return 1 ;;
+    esac
+  done
+  printf '\033[?25h' >&4
+  exec 3<&- 4>&-
+  start_choice="${choices[$at]}"
+}
+
+# choose_start [menu]: how a folder with no project starts (decision 064), in start_choice (`free`, `setup` or
+# `design`) and start_remember. A remembered free folder: free, no menu. TOWER_START=free|setup|design: that, when the
+# folder's kind offers it (else the launch stops). With `menu` and a terminal on stdin: the start menu (fails on
+# cancel). Otherwise free.
+choose_start() {
+  local kind shown
+  start_choice=free start_remember=""
+  [ -z "$remembered" ] || return 0
+  kind="$(folder_kind "$PWD")"
+  if [ -n "${TOWER_START:-}" ]; then
+    start_entries "$kind" | cut -f1 | grep -qx -- "$TOWER_START" \
+      || die "TOWER_START=$TOWER_START is not offered in this folder ($kind: $(start_entries "$kind" | cut -f1 | paste -sd ' ' -))"
+    start_choice="$TOWER_START"
+  elif [ "${1:-}" = menu ] && [ -t 0 ]; then
+    shown="$PWD"
+    case "$PWD" in "$HOME"|"$HOME"/*) shown="~${PWD#"$HOME"}" ;; esac
+    start_menu "$kind" "$shown" || return 1
+  fi
+  return 0
+}
+
+# apply_start: the choice taken. `r` is kept only for Free session; New project writes the design state
+# (tools/tower-design-state.sh init) and resolves again, now a design Tower; Git repository is a free Tower whose first session
+# starts on /tower:tower-setup (free_start).
+apply_start() {
+  free_start=""
+  if [ -n "$start_remember" ] && [ "$start_choice" = free ]; then remember_free "$(pwd -P)"; fi
+  case "$start_choice" in
+    setup) free_start=setup ;;
+    design)
+      "$plugin_root/tools/tower-design-state.sh" -C "$PWD" init >/dev/null || die "cannot write the design state in $PWD"
+      resolve_project || die "$resolve_error"
+      [ "$project_kind" = design ] || die "the design state in $PWD did not take"
+      ;;
+  esac
+  return 0
+}
+
+# tower_socket_for MAIN [record]: the tmux socket of a project other than the edition's (decision 059): `tower-<slug>`,
+# <slug> MAIN's folder name lowercased, every run of characters but letters and digits a `-`, at most 24 characters.
+# $state_dir/sockets.json keeps each main checkout's socket once a launch records it (`record`), so a project keeps
+# its socket; a slug another main checkout holds there takes `-<the first 6 hex digits of MAIN's sha1>`.
+tower_socket_for() {
+  /usr/bin/python3 -I - "$state_dir/sockets.json" "$1" "${2:-}" <<'PY'
+import hashlib, json, os, re, sys
+path, main, record = sys.argv[1], sys.argv[2], sys.argv[3] == 'record'
+try:
+    with open(path) as handle:
+        known = json.load(handle)
+except Exception:
+    known = {}
+sockets = {key: value for key, value in known.items() if isinstance(value, str)} if isinstance(known, dict) else {}
+name = sockets.get(main)
+if name is None:
+    slug = re.sub(r'[^a-z0-9]+', '-', os.path.basename(main.rstrip('/')).lower()).strip('-')[:24].strip('-') or 'project'
+    name = 'tower-' + slug
+    if any(other != main and value == name for other, value in sockets.items()):
+        name += '-' + hashlib.sha1(main.encode()).hexdigest()[:6]
+    if record:
+        sockets[main] = name
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path + '.tmp', 'w') as handle:
+                json.dump(sockets, handle, indent=2, sort_keys=True)
+                handle.write('\n')
+            os.replace(path + '.tmp', path)
+        except OSError:
+            pass
+print(name)
+PY
+}
+
+# project_socket [record]: the resolved project's tmux socket: `tower` for the edition's (as before decision 059), else
+# tower_socket_for its main checkout, so a worktree's launch finds its main checkout's Tower.
+project_socket() {
+  if [ "$project_kind" = edition ]; then printf 'tower\n'; else tower_socket_for "$project_main" "${1:-}"; fi
+}
+
+# base36 N: N in base 36, lowercase.
+base36() {
+  local n="$1" digits=0123456789abcdefghijklmnopqrstuvwxyz out=""
+  while :; do
+    out="${digits:n%36:1}$out"
+    n=$((n / 36))
+    [ "$n" -gt 0 ] || break
+  done
+  printf '%s' "$out"
+}
+
+# free_socket: a new socket for a free Tower (decision 060), one per launch: `tower-free-<the time and this process's
+# id in base 36>`, a random tail while a socket of that name is there. Never recorded, never attached to again.
+free_socket() {
+  local name dir
+  dir="$(tower_socket_dir)"
+  name="tower-free-$(base36 "$(date +%s)")$(base36 $$)"
+  while [ -e "$dir/$name" ]; do name="$name$(base36 "$RANDOM")"; done
+  printf '%s\n' "$name"
+}
+
+# tower_socket_dir: tmux's folder of this user's sockets, ${TMUX_TMPDIR:-/tmp}/tmux-<uid> (where `tmux -L` puts them).
+tower_socket_dir() {
+  printf '%s/tmux-%s\n' "${TMUX_TMPDIR:-/tmp}" "$(id -u)"
+}
+
+# tower_sockets: the path of every Tower socket of this user: `tower` and `tower-*` in tower_socket_dir, sockets only
+# (a dead server's may be left; the callers ask it). Never towergen or any other server.
+tower_sockets() {
+  local dir path
+  dir="$(tower_socket_dir)"
+  for path in "$dir"/tower "$dir"/tower-*; do
+    [ -S "$path" ] && printf '%s\n' "$path"
+  done
+  return 0
+}
+
+# tower_repo_on TMUX_ARGS...: the TOWER_REPO the Tower on that server was started with (its session's environment,
+# set by every launcher version); nothing when the server or the session is gone.
+tower_repo_on() {
+  { tmux "$@" show-environment -t tower TOWER_REPO 2>/dev/null || true; } | sed -n 's/^TOWER_REPO=//p'
+}
+
+# main_of FOLDER: the folder's main checkout (git worktree list), else the folder itself.
+main_of() {
+  local main
+  main="$(git -C "$1" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')" || main=""
+  printf '%s\n' "${main:-$1}"
+}
+
+# project_of REPO: the project's name, its main checkout's folder name; `?` without a TOWER_REPO.
+project_of() {
+  if [ -n "$1" ]; then basename "$(main_of "$1")"; else printf '?\n'; fi
+}
+
+# --list: socket, project and folder of every running Tower; read only.
+list_towers() {
+  local path repo found=""
+  while IFS= read -r path; do
+    tmux -S "$path" list-sessions >/dev/null 2>&1 || continue
+    repo="$(tower_repo_on -S "$path")"
+    [ -n "$found" ] || printf '%-28s %-20s %s\n' socket project folder
+    found=1
+    printf '%-28s %-20s %s\n' "${path##*/}" "$(project_of "$repo")" "${repo:-?}"
+  done < <(tower_sockets)
+  [ -n "$found" ] || echo "no Tower running"
+}
+
+# --kill-all: closes every running Tower (tower_sockets), saying which.
+kill_all_towers() {
+  local path repo found=""
+  while IFS= read -r path; do
+    tmux -S "$path" list-sessions >/dev/null 2>&1 || continue
+    repo="$(tower_repo_on -S "$path")"
+    tmux -S "$path" kill-server 2>/dev/null || true
+    echo "killed ${path##*/} ($(project_of "$repo") · ${repo:-?})"
+    found=1
+  done < <(tower_sockets)
+  [ -n "$found" ] || echo "no Tower running"
+}
+
+mode="attach"
+# Tower's own folder (sessions, keys, settings): TOWER_STATE_DIR (test launches: <plugin root>/.smoke/state), else ~/.claude/tower.
+state_dir="${TOWER_STATE_DIR:-$HOME/.claude/tower}"
+# resolve_theme: prints the theme to launch with: --theme ($theme_flag), else TOWER_THEME (environment or
+# .env, read before this runs), else the theme saved in the settings view (`theme` in $state_dir/settings.json,
+# else `settings.theme` in the newest Claude Code plugin store file tower_*.json from before that file; read only), else
+# ghostty when Ghostty's colours were found ($ghostty_json), else claude. A name outside the theme table
+# from the store is ignored; from the flag or TOWER_THEME it is printed for theme_colours to refuse.
+resolve_theme() {
+  if [ -n "${theme_flag:-}" ]; then printf '%s\n' "$theme_flag"; return; fi
+  if [ -n "${TOWER_THEME:-}" ]; then printf '%s\n' "$TOWER_THEME"; return; fi
+  local saved
+  saved="$(/usr/bin/python3 -I - "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/store" "$state_dir/settings.json" 2>/dev/null <<'PY'
+import glob, json, os, sys
+try:
+    if os.path.exists(sys.argv[2]):
+        with open(sys.argv[2]) as handle:
+            theme = json.load(handle)['theme']
+    else:
+        files = glob.glob(os.path.join(sys.argv[1], 'tower_*.json'))
+        with open(max(files, key=os.path.getmtime)) as handle:
+            theme = json.load(handle)['settings']['theme']
+    if isinstance(theme, str):
+        print(theme)
+except Exception:
+    pass
+PY
+)" || saved=""
+  case "$saved" in
+    ghostty|claude|terminal|matrix) printf '%s\n' "$saved" ;;
+    *) if [ -n "${ghostty_json:-}" ]; then printf 'ghostty\n'; else printf 'claude\n'; fi ;;
+  esac
+}
+
+theme_flag=""
+bg_flag=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-attach) mode="no-attach" ;;
+    --kill) mode="kill" ;;
+    --kill-all) mode="kill-all" ;;
+    --list) mode="list" ;;
+    --theme)
+      [ $# -ge 2 ] || { usage; exit 1; }
+      theme_flag="$2"
+      shift
+      ;;
+    --bg)
+      [ $# -ge 2 ] || { usage; exit 1; }
+      bg_flag="$2"
+      shift
+      ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; exit 1 ;;
+  esac
+  shift
+done
+if [ -n "$theme_flag" ]; then
+  theme_colours "$theme_flag" || die "unknown theme $theme_flag (ghostty, claude, terminal, matrix)"
+fi
+
+command -v tmux >/dev/null 2>&1 || die "tmux is not on PATH"
+command -v claude >/dev/null 2>&1 || die "claude is not on PATH"
+
+# --list and --kill-all act on every Tower of this user, whatever the folder.
+case "$mode" in
+  list) list_towers; exit 0 ;;
+  kill-all) kill_all_towers; exit 0 ;;
+esac
+
+plugin_root="$(resolve_plugin_root)"
+# TOWER_REPO and TOWER_THEME from <plugin root>/.env (else <state dir>/.env) when not already set; the edition may name
+# another line read as a fallback for TOWER_REPO (edition_file dotenv-repo: a .env shared with an older launcher).
+# LINEAR_API_KEY is read at the start of a project's Tower only.
+# TOWER_NO_DOTENV=1 (test launches) never reads it: a test must not fall back to the real repository.
+if [ "${TOWER_NO_DOTENV:-}" != 1 ]; then
+  if [ -z "${TOWER_REPO:-}" ]; then
+    repo_line="$(edition_file dotenv-repo)" || repo_line=""
+    TOWER_REPO="$(dotenv_value TOWER_REPO)" || { [ -n "$repo_line" ] && TOWER_REPO="$(dotenv_value "$repo_line")"; } || TOWER_REPO=""
+  fi
+  if [ -z "${TOWER_THEME:-}" ]; then
+    TOWER_THEME="$(dotenv_value TOWER_THEME)" || TOWER_THEME=""
+  fi
+fi
+
+# One Tower per project (decision 059): TOWER_TMUX_SOCKET when set (tests, a manual towergen, a shell in a Tower's
+# pane), else the socket of the project the current folder opens (project_socket). A folder with no project opens a
+# free Tower on a new socket at every launch (decision 060); --kill there closes nothing: it lists the running Towers
+# and how to close one.
+resolved=""
+resolve_error=""
+free_start=""
+if [ -n "${TOWER_TMUX_SOCKET:-}" ]; then
+  socket="$TOWER_TMUX_SOCKET"
+else
+  resolve_project || die "$resolve_error"
+  resolved=1
+  # A folder with no project: the start menu (decision 064), before any tmux call; esc or q ends the launch.
+  if [ "$project_kind" = free ] && [ "$mode" != kill ]; then
+    choose_start menu || exit 0
+    apply_start
+  fi
+  if [ "$project_kind" != free ]; then
+    socket="$(project_socket)"
+  elif [ "$mode" = kill ]; then
+    echo "CCtower: this folder has no project: each launch here opens a free Tower of its own; nothing closed" >&2
+    list_towers
+    echo "close one with q then y in it, TOWER_TMUX_SOCKET=<socket> CCtower --kill, or every one with CCtower --kill-all"
+    exit 1
+  else
+    socket="$(free_socket)"
+    # A free Tower never reads the Linear key, nor hands it to tmux (decision 060).
+    unset LINEAR_API_KEY
+  fi
+  # Nor a design Tower (decision 064), before its first tmux call.
+  if [ "$project_kind" = design ]; then unset LINEAR_API_KEY; fi
+fi
+session="tower"
+tmux_() { tmux -L "$socket" "$@"; }
+
+if [ "$mode" = "kill" ]; then
+  if tmux_ list-sessions >/dev/null 2>&1; then
+    running="$(tower_repo_on -L "$socket")"
+    tmux_ kill-server 2>/dev/null || true
+    echo "killed $socket ($(project_of "$running") · ${running:-?})"
+  else
+    echo "no Tower running on $socket"
+  fi
+  exit 0
+fi
+
+if tmux_ has-session -t "$session" 2>/dev/null; then
+  # A Tower an older launcher started on this socket for another project (before decision 059 every Tower was on
+  # `tower`): attaching would show that project. Never for an explicit TOWER_TMUX_SOCKET.
+  if [ -n "$resolved" ] && [ "$project_kind" != free ]; then
+    running="$(tower_repo_on -L "$socket")"
+    if [ -n "$running" ] && [ "$(main_of "$running")" != "$project_main" ]; then
+      die "socket $socket already runs the Tower of $running (started by an older launcher); close it with CCtower --kill-all (or tmux -L $socket kill-server), then launch again"
+    fi
+  fi
+else
+  if [ -z "$resolved" ]; then
+    resolve_project || die "$resolve_error"
+    # An explicit socket shows no menu: TOWER_START, else free (decision 064).
+    if [ "$project_kind" = free ]; then
+      choose_start
+      apply_start
+    fi
+  fi
+  # A project's socket is kept from its first launch on (tower_socket_for); a design Tower's too (decision 064).
+  if [ -z "${TOWER_TMUX_SOCKET:-}" ] && { [ "$project_kind" = stored ] || [ "$project_kind" = design ]; }; then
+    tower_socket_for "$project_main" record >/dev/null
+  fi
+  # The Linear key, for a project's Tower only: a free or design Tower never reads it, nor hands one on (decisions 060, 064).
+  if [ "$project_kind" = free ] || [ "$project_kind" = design ]; then
+    unset LINEAR_API_KEY
+    LINEAR_API_KEY=""
+  else
+    LINEAR_API_KEY="${LINEAR_API_KEY:-}"
+    if [ -z "$LINEAR_API_KEY" ] && [ "${TOWER_NO_DOTENV:-}" != 1 ]; then
+      LINEAR_API_KEY="$(dotenv_value LINEAR_API_KEY)" || LINEAR_API_KEY=""
+    fi
+  fi
+  # The theme (see resolve_theme) colours the frame and tmux. Only a --theme or TOWER_THEME choice goes on to
+  # the sessions as TOWER_THEME: the saved theme they read themselves, so the settings view still changes it live.
+  # Ghostty's colours (decision 039): the ghostty theme's, in $state_dir/palette.json for every session; none found,
+  # no palette file (the ghostty theme then draws with the claude colours).
+  ghostty_json="$(ghostty_palette 2>/dev/null)" || ghostty_json=""
+  launch_theme="$(resolve_theme)"
+  # One background everywhere, the terminal's: the panels are painted in it (themes/tower.json).
+  bg="$(resolve_bg "$ghostty_json")"
+  palette_file="$state_dir/palette.json"
+  if [ -n "$ghostty_json" ]; then
+    mkdir -p "$state_dir"
+    ghostty_roles "$ghostty_json" "$bg" >"$palette_file.tmp" && mv "$palette_file.tmp" "$palette_file" || die "cannot write $palette_file"
+    roles_line="$(/usr/bin/python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["faint"], r["accent"], r["text"], r["dim"])' "$palette_file")"
+    read -r ghostty_faint ghostty_accent ghostty_text ghostty_dim <<<"$roles_line"
+  else
+    rm -f "$palette_file"
+  fi
+  theme_colours "$launch_theme" || die "unknown theme $launch_theme (ghostty, claude, terminal, matrix)"
+  [ -n "$theme_flag" ] && TOWER_THEME="$theme_flag"
+  if [ "$launch_theme" = ghostty ] && [ -n "$ghostty_json" ]; then
+    write_tower_theme "$bg" "$palette_file" || die "cannot write $plugin_root/themes/tower.json"
+  else
+    write_tower_theme "$bg" || die "cannot write $plugin_root/themes/tower.json"
+  fi
+  # The key never goes on a command line (tmux -e NAME=value would show it in the process list).
+  # Exported, it reaches a tmux server this launcher starts; a running server copies it from this
+  # client's environment into the new session once update-environment names it.
+  if [ -n "$LINEAR_API_KEY" ]; then
+    export LINEAR_API_KEY
+    if tmux_ list-sessions >/dev/null 2>&1 && ! tmux_ show-options -gv update-environment 2>/dev/null | grep -qx LINEAR_API_KEY; then
+      tmux_ set-option -ga update-environment LINEAR_API_KEY
+    fi
+  fi
+  # Status files of sessions that ended long ago.
+  if [ -d "$state_dir/sessions" ]; then
+    find "$state_dir/sessions" -name '*.json' -mmin +1440 -delete
+  fi
+
+  size_args=()
+  if [ -t 1 ]; then
+    size_args=(-x "$(tput cols)" -y "$(tput lines)")
+  fi
+
+  # The rail hands it on to the ticket sessions it starts (claude --model).
+  model_args=()
+  if [ -n "${TOWER_SESSION_MODEL:-}" ]; then
+    model_args=(-e "TOWER_SESSION_MODEL=$TOWER_SESSION_MODEL")
+  fi
+  # TOWER_RAIL_MODEL sets the rail's own model (claude --model), for test configs with no model setting.
+  rail_args=()
+  if [ -n "${TOWER_RAIL_MODEL:-}" ]; then
+    rail_args=(--model "$TOWER_RAIL_MODEL")
+  fi
+  # TOWER_THEME (ghostty, claude, terminal or matrix) overrides the theme option in every session: the rail hands it on.
+  if [ -n "${TOWER_THEME:-}" ]; then
+    model_args+=(-e "TOWER_THEME=$TOWER_THEME")
+  fi
+  # TOWER_DEMO=1 fills the deck of ticket sessions with a demo state; the rail hands it on too.
+  if [ -n "${TOWER_DEMO:-}" ]; then
+    model_args+=(-e "TOWER_DEMO=$TOWER_DEMO")
+  fi
+  # TOWER_STATE_DIR and TOWER_MUTE=1 (test launches): Tower's files in that folder and no sound; the rail hands them on.
+  if [ -n "${TOWER_STATE_DIR:-}" ]; then
+    model_args+=(-e "TOWER_STATE_DIR=$TOWER_STATE_DIR")
+  fi
+  if [ -n "${TOWER_MUTE:-}" ]; then
+    model_args+=(-e "TOWER_MUTE=$TOWER_MUTE")
+  fi
+  # TOWER_MODE=free: a free Tower (decision 060); the rail hands it on to every session it starts. TOWER_MODE=design: a
+  # design Tower (decision 064). TOWER_FREE_START=setup: the start menu's Git repository, for the rail's first session only.
+  if [ "$project_kind" = free ]; then
+    model_args+=(-e TOWER_MODE=free)
+  elif [ "$project_kind" = design ]; then
+    model_args+=(-e TOWER_MODE=design)
+  fi
+  if [ "$project_kind" = free ] && [ "$free_start" = setup ]; then
+    model_args+=(-e TOWER_FREE_START=setup)
+  fi
+  # TOWER_LINEAR_FIXTURE names a file the rail reads in place of Linear (tests and demos).
+  if [ -n "${TOWER_LINEAR_FIXTURE:-}" ]; then
+    model_args+=(-e "TOWER_LINEAR_FIXTURE=$TOWER_LINEAR_FIXTURE")
+  fi
+
+  # The session's TOWER_TAG and its pane's @tower_tag: how the mod finds its pane
+  # when TMUX_PANE is missing from the session.
+  # The rail's own settings, for this session only: the theme's Claude Code theme (none for terminal),
+  # the main-screen layout and tower's status line. Same JSON as sessionSettings in hooks/core/panes.ts.
+  theme_json=""
+  [ -n "$claude_theme" ] && theme_json="\"theme\":\"${claude_theme}\","
+  statusline_json="$(printf '%s' "$plugin_root/bin/tower-statusline" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  settings="{${theme_json}\"tui\":\"default\",\"statusLine\":{\"type\":\"command\",\"command\":\"${statusline_json}\",\"padding\":0,\"refreshInterval\":1},\"disableAgentView\":true}"
+
+  tag="rail-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+
+  pane="$(tmux_ new-session -d -P -F '#{pane_id}' -s "$session" -c "$repo" ${size_args[@]+"${size_args[@]}"} \
+    -e TOWER_ROLE=rail \
+    -e "TOWER_REPO=$repo" \
+    -e "TOWER_PLUGIN_DIR=$plugin_root" \
+    -e "TOWER_TAG=$tag" \
+    -e "TOWER_TMUX_SOCKET=$socket" \
+    -e CLAUDE_CODE_TMUX_TRUECOLOR=1 \
+    -e COLORTERM=truecolor \
+    ${model_args[@]+"${model_args[@]}"} \
+    claude --plugin-dir "$plugin_root" --settings "$settings" ${rail_args[@]+"${rail_args[@]}"})"
+
+  tmux_ set-option -g mouse on
+  tmux_ set-option -g focus-events on
+  tmux_ set-option -as terminal-features ',*:RGB'
+  # Every border in one colour, the active pane's title alone in the accent (decision 006): an active border
+  # colour splits the shared divider in halves (pane-border-indicators colour, the default) or, with off,
+  # draws all of it in the accent whichever side is active.
+  tmux_ set-option -gw pane-border-style "fg=$border"
+  tmux_ set-option -gw pane-active-border-style "fg=$border"
+  tmux_ set-option -gw pane-border-status top
+  tmux_ set-option -gw pane-border-format "#{?pane_active,#[fg=$border_active],#[fg=$border]} #{@tower_title} "
+  tmux_ set-option -gw pane-border-lines single
+  # Panes never painted by tmux: the terminal's own background shows through everywhere.
+  tmux_ set-option -gw window-style bg=default
+  tmux_ set-option -gw window-active-style bg=default
+  # One hint row at the bottom, for the active pane's role: keys bright, words dim.
+  k="#[fg=$hint_key]" w="#[fg=$hint_word]"
+  rail_hints="${k}↑↓${w} switch ticket   ${k}↵${w} open   ${k}alt →${w} session   ${k}o${w} new session   ${k}k${w} skills   ${k}r${w} refresh   ${k}b${w} board   ${k}q${w} quit"
+  board_hints="${k}↑↓${w} ticket   ${k}↵${w} open   ${k}alt ←→${w} cards   ${k}c${w} list   ${k}o${w} new session   ${k}s${w} shape   ${k}n${w} new ticket   ${k}t${w} triage   ${k}k${w} all skills   ${k}r${w} refresh   ${k}q${w} quit"
+  work_hints="${k}alt ←→${w} areas   ${k}alt ↑${w} explain as   ${k}1${w} agents   ${k}2${w} routing   ${k}3${w} log   ${k}m${w} docs"
+  review_hints="${k}alt ←↑${w} areas   ${k}x${w} hide"
+  # A free Tower's rail (decision 060): no tickets, skills or board.
+  if [ "$project_kind" = free ]; then
+    rail_hints="${k}↑↓${w} move   ${k}↵${w} open   ${k}alt →${w} session   ${k}o${w} new session   ${k}r${w} refresh   ${k}q${w} quit"
+    board_hints="$rail_hints"
+  elif [ "$project_kind" = design ]; then
+    rail_hints="${k}↑↓${w} move   ${k}↵${w} open   ${k}alt →${w} session   ${k}o${w} new session   ${k}t${w} prototype   ${k}r${w} refresh   ${k}q${w} quit"
+    board_hints="$rail_hints"
+  fi
+  tmux_ set-option -g status on
+  tmux_ set-option -g status-position bottom
+  tmux_ set-option -g status-style bg=default
+  tmux_ set-option -g status-left ''
+  tmux_ set-option -g status-right ''
+  tmux_ set-option -g 'status-format[0]' " #{?#{==:#{@tower_role},rail},#{?#{==:#{@tower_mode},board},${board_hints},${rail_hints}},#{?#{==:#{@tower_role},review},${review_hints},${work_hints}}}"
+  # Alt+Left/Right/Up in a ticket, hub or free session: tmux cannot call the mod, so the word goes to
+  # $state_dir/keys/<the pane's @tower_tag>, which that session polls (deck, prompt, band, or the next pane).
+  keys_dir="$state_dir/keys"
+  mkdir -p "$keys_dir"
+  work_pane='#{||:#{==:#{@tower_role},ticket},#{||:#{==:#{@tower_role},hub},#{==:#{@tower_role},free}}}'
+  # The home (the rail as a board) takes Alt+Left/Right too: its cards' columns (decision 030).
+  arrow_pane='#{||:'"$work_pane"',#{&&:#{==:#{@tower_role},rail},#{==:#{@tower_mode},board}}}'
+  # macOS terminals (Ghostty, Terminal) send Option+Left/Right as Esc b / Esc f (word jumps), which tmux
+  # reads as M-b / M-f: bind both spellings, so Alt+Left/Right work without a terminal setting.
+  for left_key in M-Left M-b; do
+    tmux_ bind-key -n "$left_key" if-shell -F "$arrow_pane" "run-shell \"printf left > '$keys_dir/#{@tower_tag}'\"" 'select-pane -L'
+  done
+  for right_key in M-Right M-f; do
+    tmux_ bind-key -n "$right_key" if-shell -F "$arrow_pane" "run-shell \"printf right > '$keys_dir/#{@tower_tag}'\"" 'select-pane -R'
+  done
+  tmux_ bind-key -n M-Up if-shell -F "$work_pane" "run-shell \"printf up > '$keys_dir/#{@tower_tag}'\"" 'select-pane -U'
+  tmux_ bind-key -n M-Down select-pane -D
+  tmux_ set-option -p -t "$pane" @tower_role rail
+  tmux_ set-option -p -t "$pane" @tower_tag "$tag"
+  tmux_ set-option -p -t "$pane" @tower_title tickets
+fi
+
+if [ "$mode" = "attach" ]; then
+  exec tmux -L "$socket" attach -t "$session"
+fi

@@ -1,0 +1,257 @@
+#!/bin/bash
+# tower-install: the launcher level of Tower (decision 066), run by `/tower install` and `/tower uninstall` in Claude Code
+# or by hand. It checks what Tower needs and writes a small `tower` command that finds the installed plugin at every run.
+#
+#   tower-install check                                  what is there, what is missing and how to get it
+#   tower-install install [--dir DIR] [--replace] [--off-path]
+#   tower-install uninstall [--dir DIR]                  removes only the wrapper this script wrote
+#   tower-install dirs                                   writable folders on PATH under $HOME (other places for it)
+#
+# install writes DIR/tower (default ~/.local/bin/tower). Exit 3 (first line `exists<TAB><path>`, then what it is): a
+# `tower` that is not ours is there; --replace moves it aside to <path>.before-tower and writes ours. Exit 4 (first line
+# `off-path<TAB><dir>`): DIR is not on PATH; --off-path writes it anyway. Never touches anything else. Bash 3.2 (macOS).
+set -euo pipefail
+
+MARKER='tower-launcher-wrapper (claude-tower)'
+PLUGIN_ID='tower@claude-tower'
+script_root="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+state_dir="${TOWER_STATE_DIR:-$HOME/.claude/tower}"
+
+usage() {
+  sed -n '5,8p' "${BASH_SOURCE[0]}" | sed 's/^#   //'
+}
+
+# version_of COMMAND ARGS...: the first line its version flag prints, or nothing.
+version_of() {
+  "$@" 2>/dev/null | head -1 || true
+}
+
+# row MARK NAME WHY: one line of the report.
+row() {
+  printf '  %s %-30s %s\n' "$1" "$2" "$3"
+}
+
+# node_ok VERSION: v22.18 or later.
+node_ok() {
+  local v="${1#v}" major minor
+  major="${v%%.*}"
+  minor="${v#*.}"
+  minor="${minor%%.*}"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+  [ "$major" -gt 22 ] || { [ "$major" -eq 22 ] && [ "$minor" -ge 18 ]; }
+}
+
+check() {
+  local brew=() other=() v
+  echo "Tower · requirements"
+  if command -v tmux >/dev/null 2>&1; then row '✓' "$(version_of tmux -V)" "required: Tower's own tmux server and its sessions"
+  else row '✗' 'tmux' "required: Tower's own tmux server and its sessions"; brew+=(tmux); fi
+  if command -v git >/dev/null 2>&1; then row '✓' "$(version_of git --version | sed 's/ version / /')" 'required: worktrees, branches, repositories'
+  else row '✗' 'git' 'required: worktrees, branches, repositories'; brew+=(git); fi
+  if command -v claude >/dev/null 2>&1; then row '✓' "claude $(version_of claude --version | sed 's/ (Claude Code)//')" 'required: the claude CLI on PATH (every session is one)'
+  else row '✗' 'claude' 'required: the claude CLI on PATH'; other+=('claude: curl -fsSL https://claude.ai/install.sh | bash'); fi
+  if [ -x /usr/bin/python3 ] && v="$(version_of /usr/bin/python3 --version)" && [ -n "$v" ]; then row '✓' "$(printf '%s' "$v" | tr 'P' 'p')" 'required by the launcher (/usr/bin/python3)'
+  else row '✗' 'python3' 'required by the launcher (/usr/bin/python3)'; other+=('python3: xcode-select --install'); fi
+  if command -v node >/dev/null 2>&1; then
+    v="$(version_of node --version)"
+    if node_ok "$v"; then row '✓' "node $v" "22.18 or later: tower-setup's tools"
+    else row '✗' "node $v" "22.18 or later needed: tower-setup's tools"; brew+=(node); fi
+  else row '✗' 'node' "22.18 or later: tower-setup's tools (Git repository setup)"; brew+=(node); fi
+  if command -v gh >/dev/null 2>&1; then
+    v="$(version_of gh --version | sed 's/ version / /; s/ (.*//')"
+    if gh auth status >/dev/null 2>&1; then row '✓' "$v, signed in" 'GitHub projects: issues, pull requests, checks'
+    else row '!' "$v, not signed in" 'GitHub projects need it: gh auth login'; fi
+  else row '✗' 'gh' 'GitHub projects: issues, pull requests, checks'; brew+=(gh); fi
+  if [ -d /Applications/Ghostty.app ] || command -v ghostty >/dev/null 2>&1; then
+    v="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/Ghostty.app/Contents/Info.plist 2>/dev/null || true)"
+    row '✓' "Ghostty${v:+ $v}" "found · optional: the terminal Tower is developed and tested in (it takes Ghostty's colours)"
+  else row '–' 'Ghostty' 'not found · optional: the terminal Tower is tested in; other true-colour terminals with mouse support should work (untested)'; fi
+  # Presence only: the key's value is never read here, and a .env is only looked for, never opened.
+  if [ -n "${LINEAR_API_KEY:-}" ]; then row '✓' 'LINEAR_API_KEY' 'set in the environment (Linear projects)'
+  elif [ -f "$script_root/.env" ]; then row '?' 'LINEAR_API_KEY' "not in the environment; $script_root/.env is there (Tower reads its LINEAR_API_KEY= line)"
+  elif [ -f "$state_dir/.env" ]; then row '?' 'LINEAR_API_KEY' "not in the environment; $state_dir/.env is there (Tower reads its LINEAR_API_KEY= line)"
+  else row '–' 'LINEAR_API_KEY' "not set: Linear projects need it (environment, or a LINEAR_API_KEY= line in $state_dir/.env)"; fi
+  if [ "${#brew[@]}" -gt 0 ]; then echo "Missing: brew install ${brew[*]}"; fi
+  if [ "${#other[@]}" -gt 0 ]; then for v in "${other[@]}"; do echo "Missing: $v"; done; fi
+  return 0
+}
+
+# on_path DIR: DIR is one of PATH's folders (a trailing / aside).
+on_path() {
+  local dir="${1%/}" entry
+  local IFS=:
+  for entry in $PATH; do
+    [ "${entry%/}" = "$dir" ] && return 0
+  done
+  return 1
+}
+
+# ours FILE: FILE is the wrapper this script writes.
+ours() {
+  [ -f "$1" ] && [ ! -L "$1" ] && grep -qF "$MARKER" "$1"
+}
+
+# describe FILE: what a `tower` that is not ours is: its link target, else its first lines.
+describe() {
+  if [ -L "$1" ]; then echo "a link to $(readlink "$1")"
+  elif [ -f "$1" ]; then grep -v '^[[:space:]]*$' "$1" 2>/dev/null | grep -v '^#!' | head -3 | sed 's/^/  /' || true
+  else echo "not a file"; fi
+}
+
+# plugin_repo: the plugin's GitHub repository, `owner/name` of .claude-plugin/plugin.json's `repository`; the
+# wrapper's notes name it (where the plugin comes from, the marketplace to add).
+plugin_repo() {
+  /usr/bin/python3 -I -c 'import json, re, sys
+url = str(json.load(open(sys.argv[1])).get("repository", ""))
+match = re.match(r"^https://github\.com/([\w.-]+/[\w.-]+?)(?:\.git)?/?$", url)
+sys.exit(0 if match and print(match.group(1)) is None else 1)' "$script_root/.claude-plugin/plugin.json" 2>/dev/null
+}
+
+# wrapper: the `tower` command written by install, with the plugin's repository (plugin_repo) in its notes.
+# TOWER_DEV_ROOT wins; else Claude Code's record of installed plugins, read at every run (the plugin's folder is
+# versioned: it changes with every update).
+wrapper() {
+  local repo
+  repo="$(plugin_repo)" || repo="<owner>/claude-tower"
+  wrapper_text | sed "s#@PLUGIN_REPO@#$repo#g"
+}
+
+wrapper_text() {
+  cat <<'WRAPPER'
+#!/bin/sh
+# tower: Tower's launcher (https://github.com/@PLUGIN_REPO@), written by /tower install.
+# tower-launcher-wrapper (claude-tower) · /tower uninstall removes this file.
+# TOWER_DEV_ROOT=<a Tower checkout> runs that checkout's bin/CCtower; else the installed plugin's, found at every run in
+# Claude Code's installed_plugins.json (the plugin's folder changes with every version). `tower --root` prints the folder.
+# installed_root: the installPath of tower@claude-tower that has a bin/CCtower; fails when there is none.
+installed_root() {
+  /usr/bin/python3 -I - "${CLAUDE_CODE_PLUGIN_CACHE_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins}/installed_plugins.json" "$PWD" 2>/dev/null <<'PY'
+import json, os, sys
+path, cwd = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as handle:
+        entries = json.load(handle).get('plugins', {}).get('tower@claude-tower', [])
+except Exception:
+    sys.exit(1)
+
+def usable(entry):
+    return isinstance(entry, dict) and os.path.isfile(os.path.join(str(entry.get('installPath', '')), 'bin', 'CCtower'))
+
+def rank(entry):
+    # An install for this folder (project or local scope) first, then the user's, then any other.
+    project = str(entry.get('projectPath') or '').rstrip('/')
+    here = project != '' and (cwd == project or cwd.startswith(project + '/'))
+    return 0 if here else 1 if entry.get('scope') == 'user' else 2
+
+# The newest first within a rank (sorted is stable).
+found = sorted((entry for entry in entries if usable(entry)), key=lambda entry: str(entry.get('lastUpdated', '')), reverse=True)
+found = sorted(found, key=rank)
+if not found:
+    sys.exit(1)
+print(found[0]['installPath'])
+PY
+}
+if [ -n "${TOWER_DEV_ROOT:-}" ]; then
+  root="${TOWER_DEV_ROOT%/}"
+else
+  root="$(installed_root)" || root=""
+fi
+if [ "${1:-}" = --root ]; then
+  [ -n "$root" ] && printf '%s\n' "$root" && exit 0
+  exit 1
+fi
+if [ -z "$root" ] || [ ! -x "$root/bin/CCtower" ]; then
+  if [ -n "${TOWER_DEV_ROOT:-}" ]; then echo "tower: TOWER_DEV_ROOT=$TOWER_DEV_ROOT has no bin/CCtower" >&2
+  else echo "tower: Tower's plugin is not installed in Claude Code: /plugin marketplace add @PLUGIN_REPO@, then /plugin install tower@claude-tower (or set TOWER_DEV_ROOT to a checkout)" >&2; fi
+  exit 1
+fi
+exec "$root/bin/CCtower" "$@"
+WRAPPER
+}
+
+install() {
+  local dir="$HOME/.local/bin" replace="" off_path="" target tmp moved=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) [ $# -ge 2 ] || { usage >&2; exit 2; }; dir="$2"; shift ;;
+      --replace) replace=1 ;;
+      --off-path) off_path=1 ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    shift
+  done
+  case "$dir" in "~"|"~/"*) dir="$HOME${dir#\~}" ;; esac
+  case "$dir" in /*) ;; *) echo "tower install: --dir needs an absolute folder: $dir" >&2; exit 2 ;; esac
+  dir="${dir%/}"
+  target="$dir/tower"
+  if { [ -e "$target" ] || [ -L "$target" ]; } && ! ours "$target" && [ -z "$replace" ]; then
+    printf 'exists\t%s\n' "$target"
+    describe "$target"
+    exit 3
+  fi
+  if ! on_path "$dir" && [ -z "$off_path" ]; then
+    printf 'off-path\t%s\n' "$dir"
+    exit 4
+  fi
+  mkdir -p "$dir"
+  if { [ -e "$target" ] || [ -L "$target" ]; } && ! ours "$target"; then
+    mv "$target" "$target.before-tower"
+    moved="$target.before-tower"
+  fi
+  tmp="$target.tmp.$$"
+  wrapper >"$tmp"
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$target"
+  echo "✓ tower installed: $target"
+  echo "  It runs the installed plugin's bin/CCtower, found at every run (updates need nothing); TOWER_DEV_ROOT=<checkout> runs a checkout instead."
+  [ -z "$moved" ] || echo "  The tower that was there is kept as $moved."
+  if ! on_path "$dir"; then echo "  $dir is not on PATH yet: add  export PATH=\"$dir:\$PATH\"  to your shell's profile (~/.zshrc)."; fi
+  if [ -n "${TOWER_DEV_ROOT:-}" ]; then echo "  TOWER_DEV_ROOT is set ($TOWER_DEV_ROOT): tower runs that checkout."; fi
+  echo "Next: cd <a repository or a folder> && tower"
+}
+
+uninstall() {
+  local dir="$HOME/.local/bin" target
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) [ $# -ge 2 ] || { usage >&2; exit 2; }; dir="$2"; shift ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    shift
+  done
+  target="${dir%/}/tower"
+  if ours "$target"; then
+    rm -f "$target"
+    echo "✓ removed $target"
+    [ ! -e "$target.before-tower" ] || echo "  The tower that was there before is still $target.before-tower; move it back if you want it."
+  elif [ -e "$target" ] || [ -L "$target" ]; then
+    echo "tower uninstall: $target is not the wrapper /tower install writes; left alone"
+    exit 3
+  else
+    echo "tower uninstall: no tower in ${dir%/}; nothing to remove"
+  fi
+}
+
+# dirs: other places for the command: PATH's folders under $HOME that exist and are writable, each once.
+dirs() {
+  local entry seen=":"
+  local IFS=:
+  for entry in $PATH; do
+    entry="${entry%/}"
+    case "$entry" in "$HOME"/*) ;; *) continue ;; esac
+    case "$seen" in *":$entry:"*) continue ;; esac
+    seen="$seen$entry:"
+    [ -d "$entry" ] && [ -w "$entry" ] && printf '%s\n' "$entry"
+  done
+  return 0
+}
+
+case "${1:-}" in
+  check) check ;;
+  install) shift; install "$@" ;;
+  uninstall) shift; uninstall "$@" ;;
+  dirs) dirs ;;
+  -h|--help|'') usage ;;
+  *) usage >&2; exit 2 ;;
+esac
